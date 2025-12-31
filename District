@@ -1,0 +1,243 @@
+"""
+Automated, print-ready LULC map for ANY district in Nepal
+
+Data:
+- Boundary: geoBoundaries (ADM2)
+- LULC: ESA WorldCover v200
+- DEM & hillshade: SRTM
+
+Output:
+- <district>_LULC_PrintMap.png (300 DPI)
+
+Author intent:
+Reusable, automated research workflow
+"""
+
+# =============================
+# USER CONFIGURATION
+# =============================
+
+# --- Location ---
+DISTRICT_NAME = "Chitawan"      # e.g. "Chitawan"
+COUNTRY_ISO = "NPL"
+ADMIN_LEVEL = "ADM2"
+
+# --- Google Earth Engine ---
+PROJECT_ID = "Your_ID"
+
+# --- Matching behaviour ---
+ALLOW_CONTAINS_MATCH = True
+
+# --- Output quality ---
+FIG_SIZE = (10.5, 8)
+FIG_DPI = 300
+THUMB_DIM = 2200
+
+# --- LULC dataset ---
+LULC_COLLECTION = "ESA/WorldCover/v200"
+LULC_BAND = "Map"
+
+# --- DEM dataset ---
+DEM_IMAGE = "USGS/SRTMGL1_003"
+DEM_BAND = "elevation"
+
+
+# =============================
+# IMPORTS
+# =============================
+
+import io
+import json
+import re
+import requests
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from PIL import Image
+import ee
+
+
+# =============================
+# HELPER FUNCTIONS
+# =============================
+
+def safe_filename(text):
+    text = text.lower().strip()
+    text = re.sub(r"\s+", "_", text)
+    return re.sub(r"[^a-z0-9_]+", "", text)
+
+
+# =============================
+# 1) INITIALIZE EARTH ENGINE
+# =============================
+
+ee.Initialize(project=PROJECT_ID)
+
+
+# =============================
+# 2) LOAD DISTRICT BOUNDARY
+# =============================
+
+api_url = f"https://www.geoboundaries.org/api/current/gbOpen/{COUNTRY_ISO}/{ADMIN_LEVEL}/"
+meta = requests.get(api_url, timeout=60).json()
+if isinstance(meta, list):
+    meta = meta[0]
+
+geojson_url = meta.get("gjDownloadURL") or meta.get("downloadURL")
+if not geojson_url:
+    raise RuntimeError("Could not find geoBoundaries download URL.")
+
+adm2 = requests.get(geojson_url, timeout=120).json()
+gdf = gpd.GeoDataFrame.from_features(adm2["features"], crs="EPSG:4326")
+
+name_col = "shapeName"
+gdf[name_col] = gdf[name_col].astype(str)
+
+target = DISTRICT_NAME.lower()
+
+# exact match
+dist = gdf[gdf[name_col].str.lower() == target]
+
+# fallback: contains
+if dist.empty and ALLOW_CONTAINS_MATCH:
+    dist = gdf[gdf[name_col].str.lower().str.contains(target)]
+
+if dist.empty:
+    raise RuntimeError(
+        f"District '{DISTRICT_NAME}' not found.\n"
+        f"Example names: {sorted(gdf[name_col].unique())[:40]}"
+    )
+
+dist = dist.dissolve()
+geom = dist.geometry.iloc[0]
+
+minx, miny, maxx, maxy = dist.total_bounds
+
+ee_geom = ee.Geometry(
+    json.loads(gpd.GeoSeries([geom]).to_json())["features"][0]["geometry"]
+)
+
+
+# =============================
+# 3) LOAD LULC & DEM FROM EE
+# =============================
+
+lulc = (
+    ee.ImageCollection(LULC_COLLECTION)
+    .mosaic()
+    .select(LULC_BAND)
+    .clip(ee_geom)
+)
+
+dem = (
+    ee.Image(DEM_IMAGE)
+    .select(DEM_BAND)
+    .clip(ee_geom)
+)
+
+hillshade = ee.Terrain.hillshade(dem)
+
+
+# =============================
+# 4) STYLE LULC WITH HILLSHADE
+# =============================
+
+palette = [
+    "1b9e77",  # Tree cover
+    "66a61e",  # Shrubland
+    "a6d854",  # Grassland
+    "ffd92f",  # Cropland
+    "e31a1c",  # Built-up
+    "bdbdbd",  # Bare/sparse
+    "f7f7f7",  # Snow/ice
+    "1f78b4",  # Water
+    "33a02c",  # Wetland
+    "01665e",  # Mangroves
+    "80b1d3",  # Moss/lichen
+]
+
+lulc_rgb = lulc.visualize(min=10, max=100, palette=palette)
+
+shade = hillshade.divide(255)
+
+rgb = lulc_rgb.select(["vis-red", "vis-green", "vis-blue"]).toFloat()
+shaded = rgb.multiply(shade).byte()
+
+
+# =============================
+# 5) DOWNLOAD PNG FROM EE
+# =============================
+
+thumb_params = {
+    "region": ee_geom,
+    "dimensions": THUMB_DIM,
+    "format": "png"
+}
+
+thumb_url = shaded.getThumbURL(thumb_params)
+img_bytes = requests.get(thumb_url, timeout=180).content
+img = Image.open(io.BytesIO(img_bytes)).convert("RGBA")
+
+district_slug = safe_filename(DISTRICT_NAME)
+base_png = f"{district_slug}_lulc_base.png"
+img.save(base_png)
+
+
+# =============================
+# 6) CREATE PRINT-READY MAP
+# =============================
+
+fig = plt.figure(figsize=FIG_SIZE, dpi=FIG_DPI)
+ax = fig.add_axes([0.06, 0.16, 0.88, 0.78])
+
+ax.imshow(img, extent=(minx, maxx, miny, maxy), origin="upper")
+dist.boundary.plot(ax=ax, color="black", linewidth=1.2)
+
+ax.set_title(
+    f"{DISTRICT_NAME} District, Nepal — Land Use / Land Cover",
+    fontsize=14, fontweight="bold", pad=12
+)
+ax.set_axis_off()
+
+# North arrow
+ax.annotate(
+    "N",
+    xy=(0.94, 0.92), xytext=(0.94, 0.84),
+    xycoords="axes fraction", textcoords="axes fraction",
+    ha="center", va="center", fontsize=12, fontweight="bold",
+    arrowprops=dict(arrowstyle="-|>", lw=1.2)
+)
+
+# Legend
+legend_items = [
+    ("Tree cover", "#1b9e77"),
+    ("Cropland", "#ffd92f"),
+    ("Built-up", "#e31a1c"),
+    ("Water", "#1f78b4"),
+    ("Grassland", "#a6d854"),
+    ("Shrubland", "#66a61e"),
+]
+handles = [mpatches.Patch(color=c, label=l) for l, c in legend_items]
+
+fig.legend(
+    handles=handles,
+    title="Land cover (ESA WorldCover)",
+    loc="lower left",
+    bbox_to_anchor=(0.06, 0.03),
+    frameon=True,
+    fontsize=9
+)
+
+# Sources
+fig.text(
+    0.94, 0.035,
+    "Sources: ESA WorldCover v200, SRTM DEM • Boundary: geoBoundaries (ADM2)\n"
+    "Generated automatically using Python + Google Earth Engine",
+    ha="right", va="bottom", fontsize=8
+)
+
+out = f"{district_slug}_LULC_PrintMap.png"
+plt.savefig(out, dpi=FIG_DPI, bbox_inches="tight")
+plt.show()
+
+print(" Map saved:", out)
