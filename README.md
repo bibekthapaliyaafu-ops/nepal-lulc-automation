@@ -24,7 +24,7 @@ The workflow avoids manual GIS steps and is designed for **reproducible research
 
 ## Example Output
 
-![Example LULC Map](outputs/example_kailali_lulc.png)
+![Example LULC Map](Chitawan_LULC_PrintMap.png)
 
 ---
 
